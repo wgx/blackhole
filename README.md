@@ -1,4 +1,4 @@
-# Blackhole ⚫
+# Blackhole ⚫ [Experimental]
 
 Blackhole is a lossless image compressor for 8-bit (256 colours) grayscale images.
 
@@ -67,3 +67,6 @@ cargo test
 
 The test suite checks residual coding, arithmetic-coded round trips, legacy archive decoding, large constant images, and every PNG in `samples`.
 
+## No Warranty
+
+This software is provided without warranty of any kind, express or implied, including any warranty that it will work as intended.
