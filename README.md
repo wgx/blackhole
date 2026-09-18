@@ -2,6 +2,8 @@
 
 Blackhole is a lossless image compressor for 8-bit (256 colours) grayscale images.
 
+**Highly** Optimized for black and white photography, anything else will give poor results.
+
 Input images are converted to 8-bit luminance before compression. Decompression reconstructs the grayscale pixels exactly.
 
 ## Features
