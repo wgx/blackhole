@@ -508,11 +508,15 @@ fn encode_new_payload(
 }
 
 fn compress(input_path: &Path, output_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    println!("Compressing {} -> {}", input_path.display(), output_path.display());
+    println!("  Reading image...");
     let img = image::open(input_path)?.to_luma8();
     let (width, height) = img.dimensions();
     let pixels = img.as_raw();
 
+    println!("  Evaluating compression candidates...");
     let compressed_payload = encode_new_payload(pixels, width, height)?;
+    println!("  Writing compressed file...");
     let mut out_file = File::create(output_path)?;
     out_file.write_all(&compressed_payload)?;
 
@@ -652,13 +656,17 @@ fn decode_container(container: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Err
 }
 
 fn decompress(input_path: &Path, output_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    println!("Decompressing {} -> {}", input_path.display(), output_path.display());
+    println!("  Reading compressed file...");
     let mut in_file = File::open(input_path)?;
     let mut buffer = Vec::new();
     in_file.read_to_end(&mut buffer)?;
 
+    println!("  Reconstructing image...");
     let decompressed_payload = decode_container(&buffer)?;
     let (width, height, reconstructed) = decode_payload(&decompressed_payload)?;
 
+    println!("  Writing image...");
     let img_buffer: GrayImage = ImageBuffer::from_raw(width, height, reconstructed)
         .ok_or("Failed to construct image buffer from payload")?;
     img_buffer.save(output_path)?;
