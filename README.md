@@ -11,6 +11,7 @@ Input images are converted to 8-bit luminance before compression. Decompression 
 - Zigzag encoding for signed residuals
 - Context-aware binary arithmetic coding
 - DEFLATE fallback when it produces a smaller file
+- Adaptive tiled compression for photographic images
 - Wildcard input patterns for batch compression
 
 ## Requirements
@@ -65,7 +66,11 @@ Run the unit tests:
 cargo test
 ```
 
-The test suite checks residual coding, arithmetic-coded round trips, legacy archive decoding, large constant images, and every PNG in `samples`.
+The test suite checks residual coding, arithmetic-coded round trips, large constant images, and every PNG in `samples`.
+
+## Format Compatibility
+
+The current version writes and reads the versioned `GS8C`, arithmetic-coded `GS8R`, and adaptive tiled `GS8T` formats. The compressor compares whole-image and tiled candidates and keeps the smallest result. Older legacy archives are not supported.
 
 ## No Warranty
 

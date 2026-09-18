@@ -8,12 +8,16 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-const MAGIC_HEADER: &[u8; 4] = b"GS8B";
 const VERSIONED_MAGIC_HEADER: &[u8; 4] = b"GS8C";
 const RANGE_MAGIC_HEADER: &[u8; 4] = b"GS8R";
+const TILED_MAGIC_HEADER: &[u8; 4] = b"GS8T";
 const FORMAT_VERSION: u8 = 1;
 const MODE_RAW: u8 = 0;
 const MODE_ADAPTIVE: u8 = 6;
+const TILE_SHARED_MODEL: u8 = 0;
+const TILE_LOCAL_MODEL: u8 = 1;
+const TILE_CODEC_RANGE: u8 = 0;
+const TILE_CODEC_DEFLATE: u8 = 1;
 const ARITHMETIC_HALF: u32 = 0x8000_0000;
 const ARITHMETIC_QUARTER: u32 = 0x4000_0000;
 const ARITHMETIC_THREE_QUARTER: u32 = 0xC000_0000;
@@ -63,33 +67,12 @@ fn matching_paths(pattern: &str) -> Result<Vec<PathBuf>, Box<dyn std::error::Err
     Ok(glob(pattern)?.collect::<Result<Vec<_>, _>>()?)
 }
 
-/// Legacy predictor retained for reading older .bhol archives.
-fn paeth_predict(left: u8, top: u8, top_left: u8) -> u8 {
-    let a = left as i32;
-    let b = top as i32;
-    let c = top_left as i32;
-    let p = a + b - c;
-
-    let pa = (p - a).abs();
-    let pb = (p - b).abs();
-    let pc = (p - c).abs();
-
-    if pa <= pb && pa <= pc {
-        left
-    } else if pb <= pc {
-        top
-    } else {
-        top_left
-    }
-}
-
-fn predict(filter: u8, left: u8, top: u8, top_left: u8) -> u8 {
+fn predict(filter: u8, left: u8, top: u8, _top_left: u8) -> u8 {
     match filter {
         0 => 0,
         1 => left,
         2 => top,
         3 => ((left as u16 + top as u16) / 2) as u8,
-        4 => paeth_predict(left, top, top_left),
         _ => unreachable!("invalid filter"),
     }
 }
@@ -475,6 +458,118 @@ fn adaptive_filtered_data(pixels: &[u8], width: u32, height: u32) -> (Vec<u8>, V
     (filters, data)
 }
 
+fn tile_regions(width: u32, height: u32, tile_size: u32) -> Vec<(u32, u32, u32, u32)> {
+    let mut regions = Vec::new();
+    let mut tile_y = 0;
+    while tile_y < height {
+        let mut tile_x = 0;
+        let tile_height = (height - tile_y).min(tile_size);
+        while tile_x < width {
+            regions.push((tile_x, tile_y, (width - tile_x).min(tile_size), tile_height));
+            tile_x += tile_size;
+        }
+        tile_y += tile_size;
+    }
+    regions
+}
+
+fn make_tiled_header(
+    model: u8,
+    codec: u8,
+    tile_size: u32,
+    width: u32,
+    height: u32,
+    tile_count: usize,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let tile_size = u16::try_from(tile_size).map_err(|_| "Tile size is too large")?;
+    let tile_count = u32::try_from(tile_count).map_err(|_| "Too many tiles")?;
+    let mut header = Vec::with_capacity(21);
+    header.extend_from_slice(TILED_MAGIC_HEADER);
+    header.push(FORMAT_VERSION);
+    header.push(model);
+    header.push(codec);
+    header.extend_from_slice(&tile_size.to_le_bytes());
+    header.extend_from_slice(&width.to_le_bytes());
+    header.extend_from_slice(&height.to_le_bytes());
+    header.extend_from_slice(&tile_count.to_le_bytes());
+    Ok(header)
+}
+
+fn make_tile_payload(pixels: &[u8], width: u32, region: (u32, u32, u32, u32)) -> Vec<u8> {
+    let (tile_x, tile_y, tile_width, tile_height) = region;
+    let width = width as usize;
+    let mut tile_pixels = Vec::with_capacity((tile_width * tile_height) as usize);
+    for row in 0..tile_height as usize {
+        let start = (tile_y as usize + row) * width + tile_x as usize;
+        tile_pixels.extend_from_slice(&pixels[start..start + tile_width as usize]);
+    }
+
+    let (filters, data) = adaptive_filtered_data(&tile_pixels, tile_width, tile_height);
+    let mut payload = filters;
+    payload.extend_from_slice(&data);
+    payload
+}
+
+fn encode_tiled_candidate(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    tile_size: u32,
+    model: u8,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let regions = tile_regions(width, height, tile_size);
+    let tile_payloads: Vec<_> = regions
+        .iter()
+        .map(|&region| make_tile_payload(pixels, width, region))
+        .collect();
+
+    if model == TILE_SHARED_MODEL {
+        let mut payload = Vec::new();
+        for tile in &tile_payloads {
+            payload.extend_from_slice(tile);
+        }
+        let range = range_encode(&payload)?;
+        let deflate = deflate_encode(&payload)?;
+        let (codec, encoded) = if range.len() <= deflate.len() {
+            (TILE_CODEC_RANGE, range)
+        } else {
+            (TILE_CODEC_DEFLATE, deflate)
+        };
+        let mut output = make_tiled_header(
+            TILE_SHARED_MODEL,
+            codec,
+            tile_size,
+            width,
+            height,
+            regions.len(),
+        )?;
+        output.extend_from_slice(&encoded);
+        return Ok(output);
+    }
+
+    let mut output = make_tiled_header(
+        TILE_LOCAL_MODEL,
+        u8::MAX,
+        tile_size,
+        width,
+        height,
+        regions.len(),
+    )?;
+    for tile in tile_payloads {
+        let range = range_encode(&tile)?;
+        let deflate = deflate_encode(&tile)?;
+        let (codec, encoded) = if range.len() <= deflate.len() {
+            (TILE_CODEC_RANGE, range)
+        } else {
+            (TILE_CODEC_DEFLATE, deflate)
+        };
+        output.push(codec);
+        output.extend_from_slice(&u32::try_from(encoded.len())?.to_le_bytes());
+        output.extend_from_slice(&encoded);
+    }
+    Ok(output)
+}
+
 fn encode_new_payload(
     pixels: &[u8],
     width: u32,
@@ -501,6 +596,23 @@ fn encode_new_payload(
     candidates.push(range_encode(&adaptive)?);
     candidates.push(deflate_encode(&adaptive)?);
 
+    for tile_size in [64, 128, 256, 512] {
+        candidates.push(encode_tiled_candidate(
+            pixels,
+            width,
+            height,
+            tile_size,
+            TILE_SHARED_MODEL,
+        )?);
+        candidates.push(encode_tiled_candidate(
+            pixels,
+            width,
+            height,
+            tile_size,
+            TILE_LOCAL_MODEL,
+        )?);
+    }
+
     candidates
         .into_iter()
         .min_by_key(Vec::len)
@@ -508,7 +620,11 @@ fn encode_new_payload(
 }
 
 fn compress(input_path: &Path, output_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    println!("Compressing {} -> {}", input_path.display(), output_path.display());
+    println!(
+        "Compressing {} -> {}",
+        input_path.display(),
+        output_path.display()
+    );
     println!("  Reading image...");
     let img = image::open(input_path)?.to_luma8();
     let (width, height) = img.dimensions();
@@ -532,43 +648,6 @@ fn pixel_count(width: u32, height: u32) -> Result<usize, Box<dyn std::error::Err
     (width as usize)
         .checked_mul(height as usize)
         .ok_or_else(|| "Image dimensions are too large".into())
-}
-
-fn decode_legacy_payload(
-    payload: &[u8],
-) -> Result<(u32, u32, Vec<u8>), Box<dyn std::error::Error>> {
-    if payload.len() < 12 || &payload[0..4] != MAGIC_HEADER {
-        return Err("Invalid legacy file header".into());
-    }
-
-    let width = u32::from_le_bytes(payload[4..8].try_into()?);
-    let height = u32::from_le_bytes(payload[8..12].try_into()?);
-    let count = pixel_count(width, height)?;
-    let residuals = payload.get(12..).ok_or("Missing legacy pixel data")?;
-    if residuals.len() != count {
-        return Err("Legacy pixel data has an invalid length".into());
-    }
-
-    let mut reconstructed = Vec::with_capacity(count);
-    let width = width as usize;
-    for index in 0..count {
-        let x = index % width;
-        let y = index / width;
-        let left = if x > 0 { reconstructed[index - 1] } else { 0 };
-        let top = if y > 0 {
-            reconstructed[index - width]
-        } else {
-            0
-        };
-        let top_left = if x > 0 && y > 0 {
-            reconstructed[index - width - 1]
-        } else {
-            0
-        };
-        reconstructed.push(residuals[index].wrapping_add(paeth_predict(left, top, top_left)));
-    }
-
-    Ok((width as u32, height, reconstructed))
 }
 
 fn decode_new_payload(payload: &[u8]) -> Result<(u32, u32, Vec<u8>), Box<dyn std::error::Error>> {
@@ -601,7 +680,7 @@ fn decode_new_payload(payload: &[u8]) -> Result<(u32, u32, Vec<u8>), Box<dyn std
         let filters = payload.get(offset..end).ok_or("Missing filter metadata")?;
         offset = end;
         filters.to_vec()
-    } else if (1..=5).contains(&mode) {
+    } else if (1..=4).contains(&mode) {
         vec![mode - 1; height as usize]
     } else {
         return Err("Unknown .bhol compression mode".into());
@@ -634,10 +713,156 @@ fn decode_new_payload(payload: &[u8]) -> Result<(u32, u32, Vec<u8>), Box<dyn std
     Ok((width, height, reconstructed))
 }
 
+fn decode_coded_payload(codec: u8, encoded: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    match codec {
+        TILE_CODEC_RANGE => range_decode(encoded),
+        TILE_CODEC_DEFLATE => {
+            let mut decoder = DeflateDecoder::new(encoded);
+            let mut payload = Vec::new();
+            decoder.read_to_end(&mut payload)?;
+            Ok(payload)
+        }
+        _ => Err("Unknown tile codec".into()),
+    }
+}
+
+fn decode_tile_into(
+    tile_payload: &[u8],
+    region: (u32, u32, u32, u32),
+    width: u32,
+    output: &mut [u8],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (tile_x, tile_y, tile_width, tile_height) = region;
+    let tile_pixel_count = pixel_count(tile_width, tile_height)?;
+    let filter_data = tile_payload
+        .get(..tile_height as usize)
+        .ok_or("Missing tile filter data")?;
+    if filter_data.iter().any(|&filter| filter > 3) {
+        return Err("Unknown tile filter".into());
+    }
+    let residuals = tile_payload
+        .get(tile_height as usize..)
+        .ok_or("Missing tile residual data")?;
+    if residuals.len() != tile_pixel_count {
+        return Err("Tile residual data has an invalid length".into());
+    }
+
+    let tile_width = tile_width as usize;
+    let tile_height = tile_height as usize;
+    let image_width = width as usize;
+    let mut tile_pixels = Vec::with_capacity(tile_pixel_count);
+    for index in 0..tile_pixel_count {
+        let x = index % tile_width;
+        let y = index / tile_width;
+        let left = if x > 0 { tile_pixels[index - 1] } else { 0 };
+        let top = if y > 0 {
+            tile_pixels[index - tile_width]
+        } else {
+            0
+        };
+        let top_left = if x > 0 && y > 0 {
+            tile_pixels[index - tile_width - 1]
+        } else {
+            0
+        };
+        tile_pixels.push(zigzag_decode(residuals[index]).wrapping_add(predict(
+            filter_data[y],
+            left,
+            top,
+            top_left,
+        )));
+    }
+
+    for row in 0..tile_height {
+        let output_start = (tile_y as usize + row) * image_width + tile_x as usize;
+        let tile_start = row * tile_width;
+        output[output_start..output_start + tile_width]
+            .copy_from_slice(&tile_pixels[tile_start..tile_start + tile_width]);
+    }
+    Ok(())
+}
+
+fn decode_tiled_container(
+    container: &[u8],
+) -> Result<(u32, u32, Vec<u8>), Box<dyn std::error::Error>> {
+    if container.len() < 21 || !container.starts_with(TILED_MAGIC_HEADER) {
+        return Err("Invalid tiled file header".into());
+    }
+    if container[4] != FORMAT_VERSION {
+        return Err("Unsupported tiled format version".into());
+    }
+
+    let model = container[5];
+    let codec = container[6];
+    let tile_size = u16::from_le_bytes(container[7..9].try_into()?) as u32;
+    let width = u32::from_le_bytes(container[9..13].try_into()?);
+    let height = u32::from_le_bytes(container[13..17].try_into()?);
+    let tile_count = u32::from_le_bytes(container[17..21].try_into()?) as usize;
+    let regions = tile_regions(width, height, tile_size);
+    if regions.len() != tile_count {
+        return Err("Tiled archive has an invalid tile count".into());
+    }
+
+    let mut tile_payloads = Vec::with_capacity(tile_count);
+    let mut offset = 21;
+    if model == TILE_SHARED_MODEL {
+        if codec != TILE_CODEC_RANGE && codec != TILE_CODEC_DEFLATE {
+            return Err("Unknown shared tile codec".into());
+        }
+        tile_payloads.push(decode_coded_payload(codec, &container[offset..])?);
+    } else if model == TILE_LOCAL_MODEL {
+        for _ in 0..tile_count {
+            let tile_codec = *container.get(offset).ok_or("Missing tile codec")?;
+            offset += 1;
+            let length_end = offset.checked_add(4).ok_or("Tile length overflow")?;
+            let length = u32::from_le_bytes(
+                container
+                    .get(offset..length_end)
+                    .ok_or("Missing tile length")?
+                    .try_into()?,
+            ) as usize;
+            offset = length_end;
+            let tile_end = offset.checked_add(length).ok_or("Tile payload overflow")?;
+            let encoded = container
+                .get(offset..tile_end)
+                .ok_or("Missing tile payload")?;
+            tile_payloads.push(decode_coded_payload(tile_codec, encoded)?);
+            offset = tile_end;
+        }
+    } else {
+        return Err("Unknown tiled model".into());
+    }
+
+    let mut output = vec![0; pixel_count(width, height)?];
+    if model == TILE_SHARED_MODEL {
+        let mut payload_offset: usize = 0;
+        for region in regions {
+            let tile_height = region.3 as usize;
+            let tile_pixels = pixel_count(region.2, region.3)?;
+            let tile_length = tile_height + tile_pixels;
+            let tile_end = payload_offset
+                .checked_add(tile_length)
+                .ok_or("Tile data overflow")?;
+            let tile_payload = tile_payloads[0]
+                .get(payload_offset..tile_end)
+                .ok_or("Missing shared tile data")?;
+            decode_tile_into(tile_payload, region, width, &mut output)?;
+            payload_offset = tile_end;
+        }
+        if payload_offset != tile_payloads[0].len() {
+            return Err("Shared tile data has an invalid length".into());
+        }
+    } else {
+        for (region, tile_payload) in regions.into_iter().zip(tile_payloads) {
+            decode_tile_into(&tile_payload, region, width, &mut output)?;
+        }
+    }
+
+    Ok((width, height, output))
+}
+
 fn decode_payload(payload: &[u8]) -> Result<(u32, u32, Vec<u8>), Box<dyn std::error::Error>> {
-    if payload.starts_with(MAGIC_HEADER) {
-        decode_legacy_payload(payload)
-    } else if payload.starts_with(VERSIONED_MAGIC_HEADER) {
+    if payload.starts_with(VERSIONED_MAGIC_HEADER) {
         decode_new_payload(payload)
     } else {
         Err("Invalid file header: Not a recognized .bhol archive".into())
@@ -655,16 +880,29 @@ fn decode_container(container: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Err
     Ok(payload)
 }
 
+fn decode_image_container(
+    container: &[u8],
+) -> Result<(u32, u32, Vec<u8>), Box<dyn std::error::Error>> {
+    if container.starts_with(TILED_MAGIC_HEADER) {
+        decode_tiled_container(container)
+    } else {
+        decode_payload(&decode_container(container)?)
+    }
+}
+
 fn decompress(input_path: &Path, output_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    println!("Decompressing {} -> {}", input_path.display(), output_path.display());
+    println!(
+        "Decompressing {} -> {}",
+        input_path.display(),
+        output_path.display()
+    );
     println!("  Reading compressed file...");
     let mut in_file = File::open(input_path)?;
     let mut buffer = Vec::new();
     in_file.read_to_end(&mut buffer)?;
 
     println!("  Reconstructing image...");
-    let decompressed_payload = decode_container(&buffer)?;
-    let (width, height, reconstructed) = decode_payload(&decompressed_payload)?;
+    let (width, height, reconstructed) = decode_image_container(&buffer)?;
 
     println!("  Writing image...");
     let img_buffer: GrayImage = ImageBuffer::from_raw(width, height, reconstructed)
@@ -699,8 +937,7 @@ mod tests {
             .collect();
         let compressed = encode_new_payload(&pixels, width as u32, height as u32).unwrap();
 
-        let (decoded_width, decoded_height, decoded) =
-            decode_payload(&decode_container(&compressed).unwrap()).unwrap();
+        let (decoded_width, decoded_height, decoded) = decode_image_container(&compressed).unwrap();
         assert_eq!(
             (decoded_width, decoded_height),
             (width as u32, height as u32)
@@ -713,7 +950,7 @@ mod tests {
         let pixels: Vec<u8> = (0..128).map(|index| (index * 73 + 19) as u8).collect();
         let compressed = encode_new_payload(&pixels, 16, 8).unwrap();
 
-        let (_, _, decoded) = decode_payload(&decode_container(&compressed).unwrap()).unwrap();
+        let (_, _, decoded) = decode_image_container(&compressed).unwrap();
         assert_eq!(decoded, pixels);
     }
 
@@ -722,20 +959,8 @@ mod tests {
         let pixels = vec![42; 128 * 1024];
         let compressed = encode_new_payload(&pixels, 128, 1024).unwrap();
 
-        let (_, _, decoded) = decode_payload(&decode_container(&compressed).unwrap()).unwrap();
+        let (_, _, decoded) = decode_image_container(&compressed).unwrap();
         assert_eq!(decoded, pixels);
-    }
-
-    #[test]
-    fn legacy_payload_remains_readable() {
-        let mut payload = Vec::from(MAGIC_HEADER.as_slice());
-        payload.extend_from_slice(&2u32.to_le_bytes());
-        payload.extend_from_slice(&2u32.to_le_bytes());
-        payload.extend_from_slice(&[0, 10, 20, 30]);
-
-        let (width, height, pixels) = decode_legacy_payload(&payload).unwrap();
-        assert_eq!((width, height), (2, 2));
-        assert_eq!(pixels, vec![0, 10, 20, 50]);
     }
 
     #[test]
@@ -753,13 +978,25 @@ mod tests {
             let (width, height) = image.dimensions();
             let pixels = image.as_raw();
             let selected = encode_new_payload(pixels, width, height).unwrap();
-            let (_, _, decoded) = decode_payload(&decode_container(&selected).unwrap()).unwrap();
+            let (_, _, decoded) = decode_image_container(&selected).unwrap();
 
             assert_eq!(decoded, *pixels);
+            let description = if selected.starts_with(TILED_MAGIC_HEADER) {
+                let model = match selected[5] {
+                    TILE_SHARED_MODEL => "shared",
+                    TILE_LOCAL_MODEL => "local",
+                    _ => "unknown",
+                };
+                let tile_size = u16::from_le_bytes(selected[7..9].try_into().unwrap());
+                format!("tiled {tile_size}x{tile_size} {model}")
+            } else {
+                "whole-image".to_string()
+            };
             eprintln!(
-                "{}: selected={}, dimensions={}x{}",
+                "{}: selected={}, {}, dimensions={}x{}",
                 path.display(),
                 selected.len(),
+                description,
                 width,
                 height
             );
