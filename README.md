@@ -1,12 +1,12 @@
 # Blackhole ⚫ [Experimental]
 
-Blackhole is a lossless image compressor for 8-bit (256 colours) grayscale images.
+Blackhole losslessly compresses 8-bit (256 shades) grayscale images and can also create dithered 1-bit black-and-white images.
 
 **Highly** Optimized for black and white photography, anything else will give poor results.
 
-Input images are converted to 8-bit luminance before compression. Decompression reconstructs the grayscale pixels exactly.
+In the default mode, input images are converted to 8-bit luminance and decompression reconstructs those grayscale pixels exactly. The `-1bit` mode applies Floyd-Steinberg dithering and stores one bit per pixel.
 
-**Note: this is only lossless for 8-bit images, not 16-bit.**
+**The default mode is lossless only for 8-bit images, not 16-bit. The `-1bit` mode is intentionally lossy.**
 
 ## Features
 
@@ -17,6 +17,7 @@ Input images are converted to 8-bit luminance before compression. Decompression 
 - DEFLATE fallback when it produces a smaller file
 - Adaptive tiled compression for photographic images
 - Wildcard input patterns for batch compression
+- Floyd-Steinberg dithering and 1-bit monochrome output
 
 ## Requirements
 
@@ -46,6 +47,14 @@ blackhole -c input.png
 
 This creates `input.bhol` beside the source image.
 
+Compress as a 1-bit black-and-white image using Floyd-Steinberg dithering:
+
+```text
+blackhole -c -1bit input.png [output_file.bhol]
+```
+
+Decompression writes these archives as 1-bit grayscale PNGs.
+
 Compress multiple matching images. Quote the pattern so Blackhole expands it consistently across shells:
 
 ```text
@@ -74,7 +83,7 @@ The test suite checks residual coding, arithmetic-coded round trips, large const
 
 ## Format Compatibility
 
-The current version writes and reads the versioned `GS8C`, arithmetic-coded `GS8R`, and adaptive tiled `GS8T` formats. The compressor compares whole-image and tiled candidates and keeps the smallest result. Older legacy archives are not supported.
+The current version writes and reads the versioned `GS8C`, one-bit `GS1C`, arithmetic-coded `GS8R`, and adaptive tiled `GS8T` formats. The compressor compares whole-image and tiled candidates and keeps the smallest result. Older legacy archives are not supported.
 
 ## No Warranty
 

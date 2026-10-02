@@ -9,6 +9,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 const VERSIONED_MAGIC_HEADER: &[u8; 4] = b"GS8C";
+const ONE_BIT_MAGIC_HEADER: &[u8; 4] = b"GS1C";
 const RANGE_MAGIC_HEADER: &[u8; 4] = b"GS8R";
 const TILED_MAGIC_HEADER: &[u8; 4] = b"GS8T";
 const FORMAT_VERSION: u8 = 1;
@@ -24,16 +25,26 @@ const ARITHMETIC_THREE_QUARTER: u32 = 0xC000_0000;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
-    if args.len() < 3 || args.len() > 4 {
+    let one_bit = args[1..].iter().any(|arg| arg == "-1bit");
+    let positional_args: Vec<_> = args[1..]
+        .iter()
+        .filter(|arg| arg.as_str() != "-1bit")
+        .collect();
+    if positional_args.len() < 2 || positional_args.len() > 3 {
         eprintln!("Usage:");
-        eprintln!("  Compress:   blackhole -c <input_image> [output_file.bhol]");
+        eprintln!("  Compress:   blackhole -c [-1bit] <input_image> [output_file.bhol]");
         eprintln!("  Decompress: blackhole -d <input_file.bhol> <output_image.png>");
         std::process::exit(1);
     }
 
-    let flag = &args[1];
-    let input_pattern = &args[2];
-    let output_path = args.get(3).map(PathBuf::from);
+    let flag = positional_args[0].as_str();
+    let input_pattern = positional_args[1].as_str();
+    let output_path = positional_args
+        .get(2)
+        .map(|path| PathBuf::from(path.as_str()));
+    if one_bit && flag != "-c" {
+        return Err("The -1bit option can only be used when compressing".into());
+    }
     let input_paths = matching_paths(input_pattern)?;
 
     if input_paths.is_empty() {
@@ -47,13 +58,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if output_path.is_some() && input_paths.len() > 1 {
         return Err("An explicit output file can only be used with one input file".into());
     }
-    match flag.as_str() {
+    match flag {
         "-c" => {
             for input_path in &input_paths {
                 let output = output_path
                     .clone()
                     .unwrap_or_else(|| input_path.with_extension("bhol"));
-                compress(input_path, &output)?;
+                compress(input_path, &output, one_bit)?;
             }
         }
         "-d" => decompress(&input_paths[0], output_path.as_ref().unwrap())?,
@@ -371,6 +382,153 @@ fn deflate_encode(payload: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>>
     Ok(encoder.finish()?)
 }
 
+fn pack_binary_pixels(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let row_bytes = (width as usize)
+        .checked_add(7)
+        .ok_or("Image width is too large")?
+        / 8;
+    let packed_length = row_bytes
+        .checked_mul(height as usize)
+        .ok_or("Image dimensions are too large")?;
+    if pixels.len() != pixel_count(width, height)? {
+        return Err("Pixel data has an invalid length".into());
+    }
+
+    let mut packed = vec![0; packed_length];
+    for y in 0..height as usize {
+        for x in 0..width as usize {
+            if pixels[y * width as usize + x] >= 128 {
+                packed[y * row_bytes + x / 8] |= 1 << (7 - x % 8);
+            }
+        }
+    }
+    Ok(packed)
+}
+
+fn floyd_steinberg_dither(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let count = pixel_count(width, height)?;
+    if pixels.len() != count {
+        return Err("Pixel data has an invalid length".into());
+    }
+    let width = width as usize;
+    let height = height as usize;
+    let mut working: Vec<f32> = pixels.iter().map(|&pixel| pixel as f32).collect();
+    let mut binary = vec![0; count];
+
+    for y in 0..height {
+        for x in 0..width {
+            let index = y * width + x;
+            let old = working[index];
+            let new = if old < 128.0 { 0.0 } else { 255.0 };
+            binary[index] = new as u8;
+            let error = old - new;
+
+            if x + 1 < width {
+                working[index + 1] += error * 7.0 / 16.0;
+            }
+            if y + 1 < height {
+                if x > 0 {
+                    working[index + width - 1] += error * 3.0 / 16.0;
+                }
+                working[index + width] += error * 5.0 / 16.0;
+                if x + 1 < width {
+                    working[index + width + 1] += error / 16.0;
+                }
+            }
+        }
+    }
+
+    pack_binary_pixels(&binary, width as u32, height as u32)
+}
+
+fn encode_one_bit_payload(
+    packed_pixels: &[u8],
+    width: u32,
+    height: u32,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let row_bytes = (width as usize)
+        .checked_add(7)
+        .ok_or("Image width is too large")?
+        / 8;
+    let expected_length = row_bytes
+        .checked_mul(height as usize)
+        .ok_or("Image dimensions are too large")?;
+    if packed_pixels.len() != expected_length {
+        return Err("Packed pixel data has an invalid length".into());
+    }
+
+    let mut payload = Vec::with_capacity(13 + packed_pixels.len());
+    payload.extend_from_slice(ONE_BIT_MAGIC_HEADER);
+    payload.push(FORMAT_VERSION);
+    payload.extend_from_slice(&width.to_le_bytes());
+    payload.extend_from_slice(&height.to_le_bytes());
+    payload.extend_from_slice(packed_pixels);
+
+    let range = range_encode(&payload)?;
+    let deflate = deflate_encode(&payload)?;
+    Ok(if range.len() <= deflate.len() {
+        range
+    } else {
+        deflate
+    })
+}
+
+fn decode_one_bit_payload(
+    payload: &[u8],
+) -> Result<(u32, u32, Vec<u8>), Box<dyn std::error::Error>> {
+    if payload.len() < 13 || !payload.starts_with(ONE_BIT_MAGIC_HEADER) {
+        return Err("Invalid one-bit file header".into());
+    }
+    if payload[4] != FORMAT_VERSION {
+        return Err("Unsupported .bhol format version".into());
+    }
+    let width = u32::from_le_bytes(payload[5..9].try_into()?);
+    let height = u32::from_le_bytes(payload[9..13].try_into()?);
+    let row_bytes = (width as usize)
+        .checked_add(7)
+        .ok_or("Image width is too large")?
+        / 8;
+    let expected_length = row_bytes
+        .checked_mul(height as usize)
+        .ok_or("Image dimensions are too large")?;
+    let packed = payload.get(13..).ok_or("Missing packed pixel data")?;
+    if packed.len() != expected_length {
+        return Err("Packed pixel data has an invalid length".into());
+    }
+
+    let mut pixels = vec![0; pixel_count(width, height)?];
+    for y in 0..height as usize {
+        for x in 0..width as usize {
+            let bit = (packed[y * row_bytes + x / 8] >> (7 - x % 8)) & 1;
+            pixels[y * width as usize + x] = if bit == 1 { 255 } else { 0 };
+        }
+    }
+    Ok((width, height, pixels))
+}
+
+fn write_one_bit_png(
+    output_path: &Path,
+    width: u32,
+    height: u32,
+    pixels: &[u8],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let packed = pack_binary_pixels(pixels, width, height)?;
+    let file = File::create(output_path)?;
+    let mut encoder = png::Encoder::new(file, width, height);
+    encoder.set_color(png::ColorType::Grayscale);
+    encoder.set_depth(png::BitDepth::One);
+    encoder.write_header()?.write_image_data(&packed)?;
+    Ok(())
+}
+
 fn make_header(mode: u8, width: u32, height: u32) -> Vec<u8> {
     let mut header = Vec::with_capacity(14);
     header.extend_from_slice(VERSIONED_MAGIC_HEADER);
@@ -619,7 +777,11 @@ fn encode_new_payload(
         .ok_or_else(|| "No compression candidates were generated".into())
 }
 
-fn compress(input_path: &Path, output_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+fn compress(
+    input_path: &Path,
+    output_path: &Path,
+    one_bit: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "Compressing {} -> {}",
         input_path.display(),
@@ -631,7 +793,12 @@ fn compress(input_path: &Path, output_path: &Path) -> Result<(), Box<dyn std::er
     let pixels = img.as_raw();
 
     println!("  Evaluating compression candidates...");
-    let compressed_payload = encode_new_payload(pixels, width, height)?;
+    let compressed_payload = if one_bit {
+        let packed = floyd_steinberg_dither(pixels, width, height)?;
+        encode_one_bit_payload(&packed, width, height)?
+    } else {
+        encode_new_payload(pixels, width, height)?
+    };
     println!("  Writing compressed file...");
     let mut out_file = File::create(output_path)?;
     out_file.write_all(&compressed_payload)?;
@@ -861,9 +1028,13 @@ fn decode_tiled_container(
     Ok((width, height, output))
 }
 
-fn decode_payload(payload: &[u8]) -> Result<(u32, u32, Vec<u8>), Box<dyn std::error::Error>> {
-    if payload.starts_with(VERSIONED_MAGIC_HEADER) {
-        decode_new_payload(payload)
+fn decode_payload(payload: &[u8]) -> Result<(u32, u32, Vec<u8>, bool), Box<dyn std::error::Error>> {
+    if payload.starts_with(ONE_BIT_MAGIC_HEADER) {
+        let (width, height, pixels) = decode_one_bit_payload(payload)?;
+        Ok((width, height, pixels, true))
+    } else if payload.starts_with(VERSIONED_MAGIC_HEADER) {
+        let (width, height, pixels) = decode_new_payload(payload)?;
+        Ok((width, height, pixels, false))
     } else {
         Err("Invalid file header: Not a recognized .bhol archive".into())
     }
@@ -882,9 +1053,10 @@ fn decode_container(container: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Err
 
 fn decode_image_container(
     container: &[u8],
-) -> Result<(u32, u32, Vec<u8>), Box<dyn std::error::Error>> {
+) -> Result<(u32, u32, Vec<u8>, bool), Box<dyn std::error::Error>> {
     if container.starts_with(TILED_MAGIC_HEADER) {
-        decode_tiled_container(container)
+        let (width, height, pixels) = decode_tiled_container(container)?;
+        Ok((width, height, pixels, false))
     } else {
         decode_payload(&decode_container(container)?)
     }
@@ -902,12 +1074,16 @@ fn decompress(input_path: &Path, output_path: &Path) -> Result<(), Box<dyn std::
     in_file.read_to_end(&mut buffer)?;
 
     println!("  Reconstructing image...");
-    let (width, height, reconstructed) = decode_image_container(&buffer)?;
+    let (width, height, reconstructed, one_bit) = decode_image_container(&buffer)?;
 
     println!("  Writing image...");
-    let img_buffer: GrayImage = ImageBuffer::from_raw(width, height, reconstructed)
-        .ok_or("Failed to construct image buffer from payload")?;
-    img_buffer.save(output_path)?;
+    if one_bit {
+        write_one_bit_png(output_path, width, height, &reconstructed)?;
+    } else {
+        let img_buffer: GrayImage = ImageBuffer::from_raw(width, height, reconstructed)
+            .ok_or("Failed to construct image buffer from payload")?;
+        img_buffer.save(output_path)?;
+    }
 
     println!(
         "Decompressed {} to {} successfully.",
@@ -937,7 +1113,9 @@ mod tests {
             .collect();
         let compressed = encode_new_payload(&pixels, width as u32, height as u32).unwrap();
 
-        let (decoded_width, decoded_height, decoded) = decode_image_container(&compressed).unwrap();
+        let (decoded_width, decoded_height, decoded, one_bit) =
+            decode_image_container(&compressed).unwrap();
+        assert!(!one_bit);
         assert_eq!(
             (decoded_width, decoded_height),
             (width as u32, height as u32)
@@ -950,7 +1128,8 @@ mod tests {
         let pixels: Vec<u8> = (0..128).map(|index| (index * 73 + 19) as u8).collect();
         let compressed = encode_new_payload(&pixels, 16, 8).unwrap();
 
-        let (_, _, decoded) = decode_image_container(&compressed).unwrap();
+        let (_, _, decoded, one_bit) = decode_image_container(&compressed).unwrap();
+        assert!(!one_bit);
         assert_eq!(decoded, pixels);
     }
 
@@ -959,8 +1138,44 @@ mod tests {
         let pixels = vec![42; 128 * 1024];
         let compressed = encode_new_payload(&pixels, 128, 1024).unwrap();
 
-        let (_, _, decoded) = decode_image_container(&compressed).unwrap();
+        let (_, _, decoded, one_bit) = decode_image_container(&compressed).unwrap();
+        assert!(!one_bit);
         assert_eq!(decoded, pixels);
+    }
+
+    #[test]
+    fn one_bit_payload_dithers_and_round_trips_odd_width_rows() {
+        let width = 9;
+        let height = 3;
+        let pixels: Vec<u8> = (0..width * height)
+            .map(|index| ((index % width) * 31) as u8)
+            .collect();
+        let packed = floyd_steinberg_dither(&pixels, width as u32, height as u32).unwrap();
+        assert_eq!(packed.len(), 6);
+
+        let compressed = encode_one_bit_payload(&packed, width as u32, height as u32).unwrap();
+        let (decoded_width, decoded_height, decoded, one_bit) =
+            decode_image_container(&compressed).unwrap();
+        assert!(one_bit);
+        assert_eq!(
+            (decoded_width, decoded_height),
+            (width as u32, height as u32)
+        );
+        assert!(decoded.iter().all(|&pixel| pixel == 0 || pixel == 255));
+        assert_ne!(decoded, pixels);
+    }
+
+    #[test]
+    fn one_bit_decompression_writes_one_bit_png() {
+        let path =
+            std::env::temp_dir().join(format!("blackhole-one-bit-{}.png", std::process::id()));
+        write_one_bit_png(&path, 3, 2, &[0, 255, 0, 255, 0, 255]).unwrap();
+
+        let decoder = png::Decoder::new(File::open(&path).unwrap());
+        let reader = decoder.read_info().unwrap();
+        assert_eq!(reader.info().color_type, png::ColorType::Grayscale);
+        assert_eq!(reader.info().bit_depth, png::BitDepth::One);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -978,7 +1193,8 @@ mod tests {
             let (width, height) = image.dimensions();
             let pixels = image.as_raw();
             let selected = encode_new_payload(pixels, width, height).unwrap();
-            let (_, _, decoded) = decode_image_container(&selected).unwrap();
+            let (_, _, decoded, one_bit) = decode_image_container(&selected).unwrap();
+            assert!(!one_bit);
 
             assert_eq!(decoded, *pixels);
             let description = if selected.starts_with(TILED_MAGIC_HEADER) {
