@@ -1,5 +1,7 @@
 # Blackhole ⚫ [Experimental]
 
+## It crushes things
+
 Blackhole losslessly compresses 8-bit (256 shades) grayscale images and can also create dithered 1-bit black-and-white images.
 
 **Highly** Optimized for black and white photography, anything else will give poor results.
