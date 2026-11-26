@@ -4,7 +4,7 @@
 
 Blackhole losslessly compresses 8-bit (256 shades) grayscale images and can also create dithered 1-bit black-and-white images.
 
-##**Highly** Optimized for black and white photography, anything else will give poor results.
+## *Highly Optimized* for black and white photography, anything else will give poor results.
 
 In the default mode, input images are converted to 8-bit luminance and decompression reconstructs those grayscale pixels exactly. The `-1bit` mode applies Floyd-Steinberg dithering and stores one bit per pixel.
 
